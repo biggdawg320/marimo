@@ -17,9 +17,21 @@ from marimo._core.ids import mint
 from marimo._core.stream import Event, kind_of, message, utcnow
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from marimo._core.document import CellSource, Changed, Document
     from marimo._core.stream import Stream
 
 Item = protocol.Console | protocol.Display
+Body = (
+    protocol.Document
+    | protocol.Cell
+    | protocol.Runtime
+    | protocol.Attachment
+    | protocol.Run
+    | protocol.Execution
+    | Item
+)
 
 
 class Notebook:
@@ -40,6 +52,8 @@ class Notebook:
         self._backend = backend
         self._stream = stream
         self._closed = False
+        self.document: Document | None = None
+        """The document, once loaded. `None` until then."""
         self.runtime: protocol.Runtime | None = None
         self._attachments: dict[str, protocol.Attachment] = {}
         self._runs: dict[str, protocol.Run] = {}
@@ -61,6 +75,59 @@ class Notebook:
     def _require_open(self) -> None:
         if self._closed:
             raise NotFound(f"no notebook {self.id}")
+
+    # ---- document ------------------------------------------------------
+
+    def load(
+        self, document: Document, *, request_id: str | None = None
+    ) -> None:
+        """Adopt a document, publishing its cells and then the document.
+
+        Raises:
+            ValueError: If the notebook already has a document.
+        """
+        self._require_open()
+        if self.document is not None:
+            raise ValueError(f"notebook {self.id} already has a document")
+        self.document = document
+        for cell in document.cells:
+            self._publish(cell, request_id)
+        self._publish(document.document, request_id)
+
+    def replace(
+        self,
+        cells: Sequence[CellSource],
+        app_config: Mapping[str, object],
+        *,
+        request_id: str | None = None,
+    ) -> Changed:
+        """Replace the document's contents and publish what changed."""
+        document = self._require_document()
+        changed = document.replace(cells, app_config)
+        self._publish_changed(changed, request_id)
+        return changed
+
+    def mark_saved(self, *, request_id: str | None = None) -> None:
+        """Record that the document's current state is in the store."""
+        document = self._require_document().mark_saved()
+        if document is not None:
+            self._publish(document, request_id)
+
+    def _require_document(self) -> Document:
+        self._require_open()
+        if self.document is None:
+            raise Conflict(f"notebook {self.id} has no document loaded")
+        return self.document
+
+    def _publish_changed(
+        self, changed: Changed, request_id: str | None
+    ) -> None:
+        for cell in changed.cells:
+            self._publish(cell, request_id)
+        for cell_id in changed.removed:
+            self._remove("cell", cell_id, request_id)
+        if changed.document is not None:
+            self._publish(changed.document, request_id)
 
     # ---- runtime -------------------------------------------------------
 
@@ -500,14 +567,14 @@ class Notebook:
     # ---- stream --------------------------------------------------------
 
     def _snapshot(self) -> list[Event]:
-        """Return notebook objects as snapshot events, parents first."""
-        bodies: list[
-            protocol.Runtime
-            | protocol.Attachment
-            | protocol.Run
-            | protocol.Execution
-            | Item
-        ] = []
+        """Return notebook objects as snapshot events, parents first.
+
+        Cells precede the document that orders them.
+        """
+        bodies: list[Body] = []
+        if self.document is not None:
+            bodies.extend(self.document.cells)
+            bodies.append(self.document.document)
         if self.runtime is not None:
             bodies.append(self.runtime)
         bodies.extend(self._attachments.values())
@@ -537,15 +604,7 @@ class Notebook:
             runtime, self.runtime = self.runtime, None
             self._remove("runtime", runtime.id, request_id)
 
-    def _publish(
-        self,
-        body: protocol.Runtime
-        | protocol.Attachment
-        | protocol.Run
-        | protocol.Execution
-        | Item,
-        request_id: str | None,
-    ) -> None:
+    def _publish(self, body: Body, request_id: str | None) -> None:
         if (run_id := self._run_id(body)) is not None:
             request_id = self._run_requests.get(run_id)
         self._stream.publish(
@@ -555,14 +614,7 @@ class Notebook:
             run_id=self._run_id(body),
         )
 
-    def _run_id(
-        self,
-        body: protocol.Runtime
-        | protocol.Attachment
-        | protocol.Run
-        | protocol.Execution
-        | Item,
-    ) -> protocol.RunId | None:
+    def _run_id(self, body: Body) -> protocol.RunId | None:
         if isinstance(body, protocol.Run):
             return body.id
         if isinstance(body, protocol.Execution):
