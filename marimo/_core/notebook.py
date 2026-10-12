@@ -107,11 +107,32 @@ class Notebook:
         self._publish_changed(changed, request_id)
         return changed
 
-    def mark_saved(self, *, request_id: str | None = None) -> None:
+    def edit(
+        self, changes: Sequence[protocol.Change], *, request_id: str
+    ) -> protocol.EditResponse:
+        """Apply an edit as one unit and publish its effects.
+
+        Raises:
+            EditConflict: If a precondition is stale. Nothing is applied.
+            Invalid: If a change could not apply to any state.
+            Conflict: If the notebook has no document.
+        """
+        document = self._require_document()
+        applied = document.apply(changes)
+        self._publish_changed(applied.changed, request_id)
+        return protocol.EditResponse(
+            document=document.document, cells=applied.cells
+        )
+
+    def mark_saved(
+        self, *, request_id: str | None = None
+    ) -> protocol.EditResponse:
         """Record that the document's current state is in the store."""
-        document = self._require_document().mark_saved()
-        if document is not None:
-            self._publish(document, request_id)
+        document = self._require_document()
+        published = document.mark_saved()
+        if published is not None:
+            self._publish(published, request_id)
+        return protocol.EditResponse(document=document.document, cells={})
 
     def _require_document(self) -> Document:
         self._require_open()
@@ -517,7 +538,9 @@ class Notebook:
                     run_id=run_id,
                     runtime_id=runtime.id,
                     caused_by=entry.caused_by,
-                    cell_id=entry.cell_id,
+                    cell_id=None
+                    if entry.cell_id is None
+                    else protocol.CellId(entry.cell_id),
                     code=entry.code,
                     code_hash=entry.code_hash,
                     bindings=[],

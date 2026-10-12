@@ -3,6 +3,7 @@
 # Generated from host-protocol/openapi.yaml in marimo-team/pair.
 # Regenerate with `cargo xtask generate-host-protocol`.
 # ruff: noqa: TC003 - msgspec resolves annotations at runtime
+# ruff: noqa: RUF036 - the generator orders unions; the wire shape is the same
 
 from __future__ import annotations
 
@@ -79,10 +80,25 @@ class CellConfigInput(Struct):
     hide_code: bool | UnsetType = False
 
 
+if TYPE_CHECKING:
+    CellId = NewType("CellId", str)
+else:
+    CellId = NewType(
+        "CellId",
+        Annotated[
+            str,
+            Meta(
+                description="Identifies a cell within its notebook. Stable while the host serves the notebook; whether it survives a reload of the store depends on the format. `setup` is the setup cell.",
+                min_length=1,
+            ),
+        ],
+    )
+
+
 class CellInput(Struct):
     code: Annotated[str, Meta(description="The cell's source code.")]
     id: Annotated[
-        str,
+        CellId,
         Meta(
             description="The cell's id. A client chooses the id of a cell it creates."
         ),
@@ -106,7 +122,7 @@ class DeleteCell(Struct, tag_field="kind", tag="delete_cell"):
     base_etag: Annotated[
         str, Meta(description="The cell's etag as last read, or `*`.")
     ]
-    id: Annotated[str, Meta(description="The cell to remove.")]
+    id: Annotated[CellId, Meta(description="The cell to remove.")]
 
 
 class DisplayData(Struct):
@@ -305,7 +321,7 @@ class PutCell(Struct, tag_field="kind", tag="put_cell"):
     cell: CellInput
     after: (
         Annotated[
-            str,
+            CellId,
             Meta(
                 description="The cell a created cell goes after. Ignored for an existing cell."
             ),
@@ -314,7 +330,7 @@ class PutCell(Struct, tag_field="kind", tag="put_cell"):
     ) = UNSET
     before: (
         Annotated[
-            str,
+            CellId,
             Meta(
                 description="The cell a created cell goes before. Ignored for an existing cell. With neither `after` nor `before`, a created cell goes at the end."
             ),
@@ -334,7 +350,7 @@ class Range(Struct):
 
 
 class Related(Struct):
-    cell_id: str
+    cell_id: CellId
     message: Annotated[
         str,
         Meta(
@@ -453,7 +469,7 @@ class SetOrder(Struct, tag_field="kind", tag="set_order"):
         Meta(description="The document's `order_etag` as last read, or `*`."),
     ]
     order: Annotated[
-        list[str],
+        list[CellId],
         Meta(
             description="Every cell id exactly once, in the new order, counting cells this edit creates and leaving out cells it deletes."
         ),
@@ -696,7 +712,7 @@ class Document(Struct):
         NotebookId, Meta(description="The notebook this document belongs to.")
     ]
     order: Annotated[
-        list[str],
+        list[CellId],
         Meta(
             description="Cell ids in display order. A permutation of the notebook's cells, each appearing exactly once."
         ),
@@ -1133,12 +1149,7 @@ class Cell(Struct):
             description="Identifies code, name, and config together, and is the precondition for editing the cell. Its text is `code_hash`, `name`, and the config values `column`, `disabled`, `hide_code`, and `expand_output` in that order, each written as a JSON scalar such as `null`, `0`, or `true`."
         ),
     ]
-    id: Annotated[
-        str,
-        Meta(
-            description="Identifies the cell within its notebook. Stable while the host serves the notebook; whether it survives a reload of the store depends on the format. `setup` is the setup cell."
-        ),
-    ]
+    id: CellId
     name: Annotated[
         str,
         Meta(
@@ -1208,7 +1219,7 @@ class Execution(Struct):
     )
     cell_id: (
         Annotated[
-            str,
+            CellId,
             Meta(
                 description="The cell this execution belongs to. Null for scratch code, a cell outside the document."
             ),

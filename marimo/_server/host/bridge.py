@@ -10,8 +10,22 @@ from typing import TYPE_CHECKING, Any
 from marimo import _loggers
 from marimo._core import protocol
 from marimo._core.document import CellSource, Document
-from marimo._core.errors import Conflict, NotFound
+from marimo._core.errors import Conflict, EditConflict, NotFound
 from marimo._core.host import Host
+from marimo._messaging.notebook import (
+    CreateCell,
+    DeleteCell,
+    DocumentChange,
+    NotebookCell,
+    ReorderCells,
+    SetCode,
+    SetConfig,
+    SetName,
+    Transaction,
+)
+from marimo._messaging.notification import (
+    NotebookDocumentTransactionNotification,
+)
 from marimo._runtime.commands import RenameNotebookCommand
 from marimo._server.host import OPERATIONS
 from marimo._server.host.analysis import Analyzer
@@ -19,8 +33,10 @@ from marimo._server.host.backend import SessionBackend
 from marimo._server.host.index import WorkspaceIndex
 from marimo._session.events import SessionEventListener
 from marimo._session.notebook.storage import rename_no_replace
+from marimo._types.ids import CellId_t
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from marimo._ast.cell import CellConfig
@@ -115,6 +131,9 @@ class SessionBridge(SessionEventListener):
             return document
 
     def _read(self, path: str) -> tuple[list[CellSource], dict[str, Any]]:
+        return _from_file_manager(self._file_manager(path))
+
+    def _file_manager(self, path: str) -> AppFileManager:
         from marimo._server.app_defaults import AppDefaults
         from marimo._session.notebook import AppFileManager
 
@@ -123,7 +142,96 @@ class SessionBridge(SessionEventListener):
             if self._config_manager is None
             else AppDefaults.from_config_manager(self._config_manager)
         )
-        return _from_file_manager(AppFileManager(path, defaults=defaults))
+        return AppFileManager(path, defaults=defaults)
+
+    async def edit(
+        self,
+        notebook_id: str,
+        changes: Sequence[protocol.Change],
+        *,
+        request_id: str,
+    ) -> protocol.EditResponse:
+        """Apply an edit to the document, and to the session when there is one.
+
+        The file is not written; `save` does that.
+
+        Raises:
+            Conflict: If the notebook has no document.
+            EditConflict: If a precondition is stale.
+            Invalid: If a change could not apply to any state.
+        """
+        if await self.ensure_document(notebook_id) is None:
+            raise Conflict("The notebook has no document to edit")
+        notebook = self.host.notebook(notebook_id)
+        response = notebook.edit(changes, request_id=request_id)
+        session = self._session_of(notebook.id)
+        if session is not None:
+            assert notebook.document is not None
+            _forward(session, notebook.document)
+        return response
+
+    async def save(
+        self,
+        notebook_id: str,
+        *,
+        if_match: str | None,
+        request_id: str,
+    ) -> protocol.EditResponse:
+        """Write the document to its file and mark it saved.
+
+        Raises:
+            Conflict: If the notebook has no document or no file.
+            EditConflict: If `if_match` is not the document's etag.
+        """
+        if await self.ensure_document(notebook_id) is None:
+            raise Conflict("The notebook has no document to save")
+        notebook = self.host.notebook(notebook_id)
+        document = notebook.document
+        assert document is not None
+        if if_match is not None and if_match != document.document.etag:
+            raise EditConflict(
+                "The document has changed since it was read",
+                change=0,
+                cell=None,
+                document=document.document,
+            )
+        session = self._session_of(notebook.id)
+        async with self._files_lock:
+            if session is not None:
+                manager = session.app_file_manager
+                cells = list(session.document.cells)
+            else:
+                file = self.index.file_of(notebook.id)
+                if file is None:
+                    raise Conflict("The notebook has no file to save to")
+                manager = await asyncio.to_thread(
+                    self._file_manager, str(file)
+                )
+                _apply_app_config(manager, document.document.app_config)
+                cells = [_notebook_cell(cell) for cell in document.cells]
+            try:
+                await asyncio.to_thread(manager.save_from_cells, cells)
+            except Exception as e:
+                raise Conflict(f"The notebook cannot be saved: {e}") from e
+        return self.host.notebook(notebook_id).mark_saved(
+            request_id=request_id
+        )
+
+    def _session_of(self, notebook_id: protocol.NotebookId) -> Session | None:
+        backend = self._backends.get(notebook_id)
+        return None if backend is None else backend.session
+
+    def _mirror(self, notebook_id: protocol.NotebookId) -> None:
+        """Bring the document up to date with the session's after it changed."""
+        session = self._session_of(notebook_id)
+        try:
+            notebook = self.host.notebook(notebook_id)
+        except NotFound:
+            return
+        if session is None or notebook.document is None:
+            return
+        cells, app_config = _from_session(session)
+        notebook.replace(cells, app_config)
 
     def _policy(self) -> Policy:
         if self._config_manager is None:
@@ -267,6 +375,7 @@ class SessionBridge(SessionEventListener):
             file,
             self._manager,
             observe,
+            document_changed=lambda: self._mirror(notebook_id),
         )
         self._backends[notebook_id] = backend
         return backend
@@ -302,7 +411,12 @@ class SessionBridge(SessionEventListener):
 
 def _from_session(session: Session) -> tuple[list[CellSource], dict[str, Any]]:
     cells = [
-        CellSource(cell.id, cell.code, cell.name, _config(cell.config))
+        CellSource(
+            protocol.CellId(cell.id),
+            cell.code,
+            cell.name,
+            _config(cell.config),
+        )
         for cell in session.document.cells
     ]
     return cells, session.app_file_manager.app.config.asdict_difference()
@@ -312,7 +426,12 @@ def _from_file_manager(
     manager: AppFileManager,
 ) -> tuple[list[CellSource], dict[str, Any]]:
     cells = [
-        CellSource(data.cell_id, data.code, data.name, _config(data.config))
+        CellSource(
+            protocol.CellId(data.cell_id),
+            data.code,
+            data.name,
+            _config(data.config),
+        )
         for data in manager.app.cell_manager.cell_data()
     ]
     return cells, manager.app.config.asdict_difference()
@@ -324,4 +443,92 @@ def _config(config: CellConfig) -> protocol.CellConfig:
         disabled=config.disabled,
         hide_code=config.hide_code,
         expand_output=config.expand_output,
+    )
+
+
+def _cell_config(config: protocol.CellConfig) -> CellConfig:
+    from marimo._ast.cell import CellConfig
+
+    return CellConfig(
+        column=config.column,
+        disabled=config.disabled,
+        hide_code=config.hide_code,
+        expand_output=config.expand_output,
+    )
+
+
+def _notebook_cell(cell: protocol.Cell) -> NotebookCell:
+    return NotebookCell(
+        id=CellId_t(cell.id),
+        code=cell.code,
+        name=cell.name,
+        config=_cell_config(cell.config),
+    )
+
+
+def _apply_app_config(
+    manager: AppFileManager, app_config: dict[str, Any]
+) -> None:
+    from marimo._ast.app_config import _AppConfig
+
+    manager.app.update_config({**_AppConfig().asdict(), **app_config})
+
+
+def _forward(session: Session, document: Document) -> None:
+    """Apply the document's state to the session as one transaction.
+
+    The session tells its consumers, so the frontend sees the edit, and
+    the host backend mirrors it back as a no-op.
+    """
+    current = session.document
+    changes: list[DocumentChange] = []
+    previous: str | None = None
+    for cell in document.cells:
+        cell_id = CellId_t(cell.id)
+        existing = current.get(cell_id)
+        if existing is None:
+            changes.append(
+                CreateCell(
+                    cell_id=cell_id,
+                    code=cell.code,
+                    name=cell.name,
+                    config=_cell_config(cell.config),
+                    after=None if previous is None else CellId_t(previous),
+                )
+            )
+        else:
+            if existing.code != cell.code:
+                changes.append(SetCode(cell_id=cell_id, code=cell.code))
+            if existing.name != cell.name:
+                changes.append(SetName(cell_id=cell_id, name=cell.name))
+            if _config(existing.config) != cell.config:
+                changes.append(
+                    SetConfig(
+                        cell_id=cell_id,
+                        column=cell.config.column,
+                        disabled=cell.config.disabled,
+                        hide_code=cell.config.hide_code,
+                        expand_output=cell.config.expand_output,
+                    )
+                )
+        previous = cell.id
+    wanted = {str(cell.id) for cell in document.cells}
+    changes.extend(
+        DeleteCell(cell_id=cell_id)
+        for cell_id in current.cell_ids
+        if cell_id not in wanted
+    )
+    if [c for c in current.cell_ids if c in wanted] != [
+        CellId_t(c) for c in document.order
+    ]:
+        changes.append(
+            ReorderCells(cell_ids=tuple(CellId_t(c) for c in document.order))
+        )
+    _apply_app_config(session.app_file_manager, document.document.app_config)
+    if not changes:
+        return
+    applied = current.apply(Transaction(changes=tuple(changes), source="host"))
+    session.notify(
+        NotebookDocumentTransactionNotification(transaction=applied),
+        from_consumer_id=None,
     )
